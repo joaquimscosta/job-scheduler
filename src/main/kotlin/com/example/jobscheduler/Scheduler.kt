@@ -1,13 +1,22 @@
 package com.example.jobscheduler
 
+import io.rsocket.loadbalance.LoadbalanceRSocketClient
+import io.rsocket.loadbalance.LoadbalanceTarget
+import io.rsocket.util.DefaultPayload
 import mu.KotlinLogging
 import org.quartz.*
 import org.quartz.SimpleScheduleBuilder.simpleSchedule
 import org.quartz.impl.matchers.GroupMatcher
+import org.springframework.messaging.handler.annotation.MessageMapping
+import org.springframework.messaging.rsocket.RSocketRequester
+import org.springframework.messaging.rsocket.annotation.ConnectMapping
 import org.springframework.scheduling.quartz.QuartzJobBean
 import org.springframework.stereotype.Component
+import org.springframework.stereotype.Controller
 import org.springframework.stereotype.Service
-import org.springframework.web.bind.annotation.*
+import reactor.core.publisher.Flux
+import reactor.core.publisher.Mono
+import reactor.kotlin.core.publisher.toFlux
 import java.io.Serializable
 import java.time.Instant
 import java.util.*
@@ -17,16 +26,26 @@ import javax.annotation.PreDestroy
 const val JOB_DATA_KEY: String = "timerInfo"
 
 @Component
-class HelloWorldJob :
+class HelloWorldJob(
+    private val rSocketClients: RSocketClients
+) :
     QuartzJobBean() {
     val logger = KotlinLogging.logger {}
 
     override fun executeInternal(context: JobExecutionContext) {
-        logger.debug { "Hello World @ ${Instant.now()}" }
+        logger.debug { "Executing job @ ${Instant.now()}" }
         val job = context.mergedJobDataMap[JOB_DATA_KEY] as? TimerInfo
-        job?.let {
-            logger.debug { it }
-        }
+        job?.let { logger.debug { "jobData= $it" } }
+
+        logger.info { "clients size = ${rSocketClients.clientList().size}" }
+
+        rSocketClients.clientList()
+            .forEach { requester ->
+                val msg = DefaultPayload.create("Hello 123?")
+                requester.rsocketClient()
+                    .fireAndForget(Mono.just(msg))
+                    .subscribe()
+            }
     }
 }
 
@@ -74,34 +93,88 @@ class FireCountListener(
     }
 }
 
-@RestController
-@RequestMapping("/api/schedule")
-class SchedulerController(private val scheduleService: ScheduleService) {
-    @PostMapping
-    fun createJob() {
-        val job = TimerInfo(
-            totalFireCount = 5,
-            repeatIntervalMs = 5000,
-            initialOffsetMs = 0,
-            runForEver = false
-        )
-        scheduleService.schedule(HelloWorldJob::class.java, job)
+@Component
+class RSocketClients {
+    private val clients = mutableListOf<RSocketRequester>()
+
+    fun addClient(rSocketRequester: RSocketRequester): Boolean = clients.add(rSocketRequester)
+    fun removeClient(rSocketRequester: RSocketRequester): Boolean = clients.remove(rSocketRequester)
+
+    fun clientList(): List<RSocketRequester> = clients.toList()
+
+    fun loadBalancedClient(): LoadbalanceRSocketClient {
+
+//        LoadbalanceTarget.from("", )
+
+       val rSocketRequester =  clients.first()
+        val loadBalanced = LoadbalanceRSocketClient.builder {
+
+
+        }.build()
+
+        return loadBalanced
+    }
+}
+
+@Controller
+class SchedulerController(
+    private val scheduleService: ScheduleService,
+    private val rSocketClients: RSocketClients
+) {
+    private val logger = KotlinLogging.logger { }
+
+    @ConnectMapping("setup")
+    fun handle(requester: RSocketRequester) {
+        logger.info { "******* entering handle ******" }
+        logger.info { "requester= $requester" }
+        requester
+            .rsocket()
+            ?.run {
+                onClose()
+                    .doFirst {
+                        logger.info("Client CONNECTED")
+                        rSocketClients.addClient(requester)
+                    }
+                    .doOnError {
+                        logger.warn { "Channel to client CLOSED" }
+                    }
+                    .doFinally {
+                        rSocketClients.removeClient(requester)
+                        logger.info("Client DISCONNECTED")
+                    }
+                    .subscribe()
+            }
     }
 
-    @GetMapping
-    fun findAllJobs(): List<TimerInfo> {
-        return scheduleService.findAllJobs()
+    @MessageMapping("schedule.create")
+    fun createJob(job: TimerInfo): Mono<Date?> {
+//        val job = TimerInfo(
+//            totalFireCount = 5,
+//            repeatIntervalMs = 5000,
+//            initialOffsetMs = 0,
+//            runForEver = false
+//        )
+        val time = scheduleService.schedule(HelloWorldJob::class.java, job)
+        if (time != null) {
+            return Mono.just(time)
+        }
+        return Mono.empty()
     }
 
-    @GetMapping("{jobName}")
-    fun findJob(@PathVariable jobName: String): TimerInfo? {
-        return scheduleService.findById(jobName)
+    @MessageMapping("schedule.all")
+    fun findAllJobs(): Flux<TimerInfo> {
+        return scheduleService.findAllJobs().toFlux()
     }
 
-    @DeleteMapping("{jobName}")
-    fun deleteJob(@PathVariable jobName: String): Boolean {
-        return scheduleService.deleteJob(jobName)
-    }
+//    @MessageMapping("schedule.get/{jobName}")
+//    fun findJob(@PathVariable jobName: String): TimerInfo? {
+//        return scheduleService.findById(jobName)
+//    }
+//
+//    @MessageMapping("schedule.delete/{jobName}")
+//    fun deleteJob(@PathVariable jobName: String): Boolean {
+//        return scheduleService.deleteJob(jobName)
+//    }
 }
 
 @Service
@@ -148,13 +221,14 @@ class ScheduleService(private val scheduler: Scheduler) {
     fun schedule(
         jobClass: Class<out Job>,
         timerInfo: TimerInfo
-    ) {
+    ): Date? {
         val job = TimerUtils.buildJobDetail(jobClass, timerInfo)
         val trigger = TimerUtils.buildTrigger(timerInfo)
-        try {
+        return try {
             scheduler.scheduleJob(job, trigger)
         } catch (e: SchedulerException) {
             logger.error(e) { "Failed to scheduling job" }
+            null
         }
     }
 
@@ -177,12 +251,12 @@ class ScheduleService(private val scheduler: Scheduler) {
 }
 
 data class TimerInfo(
-    var totalFireCount: Int,
-    var repeatIntervalMs: Long,
-    var initialOffsetMs: Long = 0,
+    var startTime: Instant = Instant.now(),
+    var repeatIntervalMs: Long = 0,
     var runForEver: Boolean = false,
-    var callbackData: String = "",
-    var jobName: UUID = UUID.randomUUID()
+    var description: String = "",
+    var jobId: UUID = UUID.randomUUID(),
+    var totalFireCount: Int = 5,
 ) : Serializable
 
 object TimerUtils {
@@ -190,7 +264,7 @@ object TimerUtils {
         jobClass: Class<out Job>,
         timerInfo: TimerInfo
     ): JobDetail {
-        val key = JobKey(timerInfo.jobName.toString())
+        val key = JobKey(timerInfo.jobId.toString())
         val data = JobDataMap().apply {
             this[JOB_DATA_KEY] = timerInfo
         }
@@ -202,19 +276,22 @@ object TimerUtils {
     }
 
     fun buildTrigger(timerInfo: TimerInfo): Trigger {
-        val scheduleBuilder =
-            simpleSchedule().withIntervalInMilliseconds(timerInfo.repeatIntervalMs)
-        if (timerInfo.runForEver) {
-            scheduleBuilder.repeatForever()
-        } else {
-            scheduleBuilder.withRepeatCount(timerInfo.totalFireCount - 1)
-        }
-        val startAt = Date.from(Instant.now().plusMillis(timerInfo.initialOffsetMs))
-        return TriggerBuilder
+        println("timerInfo.totalFireCount: ${timerInfo.totalFireCount}")
+        val trigger = TriggerBuilder
             .newTrigger()
-            .withSchedule(scheduleBuilder)
-            .startAt(startAt)
-            .build()
+            .startAt(Date.from(timerInfo.startTime))
+        if (timerInfo.repeatIntervalMs > 0) {
+            val scheduleBuilder =
+                simpleSchedule()
+                    .withIntervalInMilliseconds(timerInfo.repeatIntervalMs)
+            if (timerInfo.runForEver) {
+                scheduleBuilder.repeatForever()
+            } else {
+                scheduleBuilder.withRepeatCount(timerInfo.totalFireCount - 1)
+            }
+            trigger.withSchedule(scheduleBuilder)
+        }
+        return trigger.build()
     }
 }
 
